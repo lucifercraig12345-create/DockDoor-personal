@@ -10,7 +10,7 @@ jobs:
       - name: Setup Latest Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-beta
+          xcode-version: '26.3.0'
           
       - name: Build the Mac App
         run: |
