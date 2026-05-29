@@ -8,6 +8,22 @@ class PreviewStateCoordinator: ObservableObject {
     @Published var windowSwitcherActive: Bool = false {
         didSet { invalidateFilterCache() }
     }
+    
+    // --- ADDED: Link Trackpad Swipes to the Window Navigation ---
+    init() {
+        TrackpadGestureManager.shared.onSwipe = { [weak self] deltaX, deltaY in
+            Task { @MainActor in
+                guard let self = self else { return }
+                
+                if deltaX == 1 {
+                    self.cycleForward()   // Swiped Right -> Next Window
+                } else if deltaX == -1 {
+                    self.cycleBackward()  // Swiped Left -> Previous Window
+                }
+            }
+        }
+    }
+    // ------------------------------------------------------------
 
     // MARK: - Keybind Session Tracking
 
@@ -35,6 +51,579 @@ class PreviewStateCoordinator: ObservableObject {
     }
 
     @Published private(set) var focusedWindowID: CGWindowID?
+
+    var shouldScrollToIndex: Bool = true
+
+    @Published var searchQuery: String = "" {
+        didSet {
+            invalidateFilterCache()
+            if windowSwitcherActive {
+                Task { @MainActor in
+                    updateIndexForSearch()
+                }
+            }
+        }
+    }
+
+    private var cachedFilteredIndices: [Int]?
+    private func invalidateFilterCache() { cachedFilteredIndices = nil }
+
+    @MainActor
+    func setFocusedWindowID(_ windowID: CGWindowID?) {
+        focusedWindowID = windowID
+    }
+
+    @MainActor
+    func refreshFocusedWindowID(from newWindows: [WindowInfo]? = nil) {
+        focusedWindowID = Self.currentFocusedWindowID(in: newWindows ?? windows)
+    }
+
+    private static func currentFocusedWindowID(in windows: [WindowInfo]) -> CGWindowID? {
+        guard let activeAppWindow = windows.first(where: { $0.app.isActive }),
+              let focusedWindow = try? activeAppWindow.appAxElement.focusedWindow()
+        else { return nil }
+        return try? focusedWindow.cgWindowId()
+    }
+
+    var hasActiveSearch: Bool {
+        !searchQuery.isEmpty
+    }
+
+    struct DimensionState: Equatable {
+        var overallMaxPreviewDimension: CGPoint = .zero
+        var windowDimensionsMap: [Int: WindowPreviewHoverContainer.WindowDimensions] = [:]
+        var effectiveGridColumns: Int = 1
+        var effectiveGridRows: Int = 1
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.overallMaxPreviewDimension == rhs.overallMaxPreviewDimension
+                && lhs.effectiveGridColumns == rhs.effectiveGridColumns
+                && lhs.effectiveGridRows == rhs.effectiveGridRows
+                && lhs.windowDimensionsMap.count == rhs.windowDimensionsMap.count
+        }
+    }
+
+    @Published var dimensionState = DimensionState()
+    var expectedContentSize: CGSize = .zero
+    var hasEmbeddedContent: Bool = false
+
+    var onFrameRefreshNeeded: (() -> Void)?
+    private var lastKnownBestGuessMonitor: NSScreen?
+
+    enum WindowState {
+        case windowSwitcher
+        case fullWindowPreview
+        case both
+    }
+
+    @MainActor
+    func setShowing(_ state: WindowState? = .both, toState: Bool) {
+        let oldSwitcherState = windowSwitcherActive
+        switch state {
+        case .windowSwitcher:
+            windowSwitcherActive = toState
+        case .fullWindowPreview:
+            fullWindowPreviewActive = toState
+        case .both:
+            windowSwitcherActive = toState
+            fullWindowPreviewActive = toState
+        case .none:
+            return
+        }
+
+        if !oldSwitcherState, windowSwitcherActive {
+            hasMovedSinceOpen = false
+            initialHoverLocation = nil
+        }
+
+        // If window switcher state changed and we have windows, recalculate dimensions
+        if oldSwitcherState != windowSwitcherActive, !windows.isEmpty {
+            if let monitor = lastKnownBestGuessMonitor {
+                let dockPosition = DockUtils.getDockPosition()
+                recomputeAndPublishDimensions(dockPosition: dockPosition, bestGuessMonitor: monitor)
+            }
+        }
+    }
+
+    @MainActor
+    func setIndex(to: Int, shouldScroll: Bool = true) {
+        shouldScrollToIndex = shouldScroll
+        if to >= 0, to < windows.count {
+            currIndex = to
+        } else {
+            currIndex = -1
+        }
+    }
+
+    @MainActor
+    func setWindows(_ newWindows: [WindowInfo], dockPosition: DockPosition, bestGuessMonitor: NSScreen, isMockPreviewActive: Bool = false) {
+        windows = newWindows
+        refreshFocusedWindowID(from: newWindows)
+        lastKnownBestGuessMonitor = bestGuessMonitor
+
+        if currIndex >= windows.count {
+            currIndex = windows.isEmpty ? -1 : windows.count - 1
+        }
+
+        recomputeAndPublishDimensions(dockPosition: dockPosition, bestGuessMonitor: bestGuessMonitor, isMockPreviewActive: isMockPreviewActive)
+    }
+
+    /// Merges fresh windows into the current display without jarring replacement.
+    /// Preserves window order and selected index where possible.
+    @MainActor
+    func mergeWindows(_ freshWindows: [WindowInfo], dockPosition: DockPosition, bestGuessMonitor: NSScreen) {
+        guard !windows.isEmpty else {
+            setWindows(freshWindows, dockPosition: dockPosition, bestGuessMonitor: bestGuessMonitor)
+            return
+        }
+
+        let previousWindowCount = windows.count
+        let selectedWindowID: CGWindowID? = (currIndex >= 0 && currIndex < windows.count) ? windows[currIndex].id : nil
+
+        let freshWindowsByID: [CGWindowID: WindowInfo] = Dictionary(
+            freshWindows.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let freshIDs = Set(freshWindowsByID.keys)
+        let existingIDs = Set(windows.map(\.id))
+
+        // Update existing windows in place
+        for index in windows.indices {
+            if let fresh = freshWindowsByID[windows[index].id] {
+                windows[index] = fresh
+            }
+        }
+
+        // Add new windows at the end
+        for freshWindow in freshWindows where !existingIDs.contains(freshWindow.id) {
+            windows.append(freshWindow)
+        }
+
+        // Remove stale windows
+        let staleIDs = existingIDs.subtracting(freshIDs)
+        if !staleIDs.isEmpty {
+            windows.removeAll { staleIDs.contains($0.id) }
+        }
+
+        // Restore selection to the same window, or clamp if it was removed
+        if let selectedID = selectedWindowID, let newIndex = windows.firstIndex(where: { $0.id == selectedID }) {
+            currIndex = newIndex
+        } else if currIndex >= windows.count {
+            currIndex = windows.isEmpty ? -1 : windows.count - 1
+        }
+
+        lastKnownBestGuessMonitor = bestGuessMonitor
+        refreshFocusedWindowID()
+        recomputeAndPublishDimensions(dockPosition: dockPosition, bestGuessMonitor: bestGuessMonitor)
+
+        if windows.count != previousWindowCount {
+            onFrameRefreshNeeded?()
+        }
+    }
+
+    @MainActor
+    func updateWindow(at index: Int, with newInfo: WindowInfo) {
+        guard index >= 0, index < windows.count else { return }
+        windows[index] = newInfo
+    }
+
+    @MainActor
+    func removeWindow(at indexToRemove: Int) {
+        guard indexToRemove >= 0, indexToRemove < windows.count else { return }
+
+        let oldCurrIndex = currIndex
+        windows.remove(at: indexToRemove)
+
+        if windows.isEmpty {
+            currIndex = -1
+            SharedPreviewWindowCoordinator.activeInstance?.hideWindow()
+            return
+        }
+
+        if oldCurrIndex == indexToRemove {
+            currIndex = min(indexToRemove, windows.count - 1)
+        } else if oldCurrIndex > indexToRemove {
+            currIndex = oldCurrIndex - 1
+        }
+
+        if currIndex >= windows.count {
+            currIndex = windows.count - 1
+        }
+
+        // Recompute dimensions and request frame refresh
+        if let monitor = lastKnownBestGuessMonitor {
+            let dockPosition = DockUtils.getDockPosition()
+            recomputeAndPublishDimensions(dockPosition: dockPosition, bestGuessMonitor: monitor)
+            onFrameRefreshNeeded?()
+        }
+    }
+
+    @MainActor
+    func removeWindow(byAx ax: AXUIElement) {
+        guard let indexToRemove = windows.firstIndex(where: { $0.axElement == ax }) else {
+            return // Window not found
+        }
+        removeWindow(at: indexToRemove)
+    }
+
+    @MainActor
+    func addWindows(_ newWindowsToAdd: [WindowInfo]) {
+        guard !newWindowsToAdd.isEmpty else { return }
+        // Gate additions by PID of the currently displayed windows (if any)
+        guard let currentPid = windows.first?.app.processIdentifier else {
+            // No active windows context; ignore additions to avoid cross-app injection
+            return
+        }
+        let gated: [WindowInfo] = newWindowsToAdd.filter { $0.app.processIdentifier == currentPid }
+
+        var windowsWereAdded = false
+        for newWin in gated {
+            if !windows.contains(where: { $0.id == newWin.id }) {
+                windows.append(newWin)
+                windowsWereAdded = true
+            }
+        }
+
+        // Recompute dimensions if any windows were added
+        if windowsWereAdded, let monitor = lastKnownBestGuessMonitor {
+            let dockPosition = DockUtils.getDockPosition()
+            recomputeAndPublishDimensions(dockPosition: dockPosition, bestGuessMonitor: monitor)
+            onFrameRefreshNeeded?()
+        }
+    }
+
+    @MainActor
+    func removeAllWindows() {
+        windows.removeAll()
+        currIndex = -1 // Reset to no selection
+        SharedPreviewWindowCoordinator.activeInstance?.hideWindow()
+    }
+
+    @MainActor
+    func recomputeAndPublishDimensions(dockPosition: DockPosition, bestGuessMonitor: NSScreen, isMockPreviewActive: Bool = false) {
+        let panelSize = getWindowSize()
+
+        let newOverallMaxDimension = WindowPreviewHoverContainer.calculateOverallMaxDimensions(
+            windows: windows,
+            dockPosition: dockPosition,
+            isWindowSwitcherActive: windowSwitcherActive,
+            isMockPreviewActive: isMockPreviewActive,
+            sharedPanelWindowSize: panelSize
+        )
+
+        let (cols, rows) = WindowPreviewHoverContainer.calculateEffectiveMaxColumnsAndRows(
+            bestGuessMonitor: bestGuessMonitor,
+            overallMaxDimensions: newOverallMaxDimension,
+            dockPosition: dockPosition,
+            isWindowSwitcherActive: windowSwitcherActive,
+            previewMaxColumns: Defaults[.previewMaxColumns],
+            previewMaxRows: Defaults[.previewMaxRows],
+            switcherMaxRows: Defaults[.switcherMaxRows],
+            totalItems: windows.count
+        )
+
+        let newDimensionsMap = WindowPreviewHoverContainer.precomputeWindowDimensions(
+            windows: windows,
+            overallMaxDimensions: newOverallMaxDimension,
+            bestGuessMonitor: bestGuessMonitor,
+            dockPosition: dockPosition,
+            isWindowSwitcherActive: windowSwitcherActive,
+            effectiveMaxColumns: cols,
+            effectiveMaxRows: rows
+        )
+
+        dimensionState = DimensionState(
+            overallMaxPreviewDimension: newOverallMaxDimension,
+            windowDimensionsMap: newDimensionsMap,
+            effectiveGridColumns: cols,
+            effectiveGridRows: rows
+        )
+
+        let compactThreshold = if windowSwitcherActive {
+            Defaults[.windowSwitcherCompactThreshold]
+        } else if dockPosition == .cmdTab {
+            Defaults[.cmdTabCompactThreshold]
+        } else {
+            Defaults[.dockPreviewCompactThreshold]
+        }
+        let wouldUseCompactMode = Defaults[.disableImagePreview]
+            || (compactThreshold > 0 && windows.count >= compactThreshold)
+
+        if Defaults[.allowDynamicImageSizing], !wouldUseCompactMode {
+            let minimumItemWidth = if windowSwitcherActive {
+                min(
+                    newOverallMaxDimension.x,
+                    WindowPreviewHoverContainer.dynamicSwitcherMinimumCardWidth
+                )
+            } else {
+                CGFloat.zero
+            }
+            expectedContentSize = Self.computeExpectedContentSize(
+                windowCount: windows.count,
+                dimensionsMap: newDimensionsMap,
+                isHorizontal: windowSwitcherActive ? true : dockPosition.isHorizontalFlow,
+                maxColumns: cols,
+                maxRows: rows,
+                hasEmbeddedContent: hasEmbeddedContent,
+                fillToLimit: windowSwitcherActive && Defaults[.windowSwitcherScrollDirection] == .vertical,
+                minimumItemWidth: minimumItemWidth
+            )
+        } else {
+            expectedContentSize = .zero
+        }
+    }
+
+    private static let estimatedEmbeddedWidgetHeight: CGFloat = 100
+
+    private static func computeExpectedContentSize(
+        windowCount: Int,
+        dimensionsMap: [Int: WindowPreviewHoverContainer.WindowDimensions],
+        isHorizontal: Bool,
+        maxColumns: Int,
+        maxRows: Int,
+        hasEmbeddedContent: Bool = false,
+        fillToLimit: Bool = false,
+        minimumItemWidth: CGFloat = 0
+    ) -> CGSize {
+        guard windowCount > 0 else { return .zero }
+
+        let itemSpacing = HoverContainerPadding.itemSpacing
+        let padding = HoverContainerPadding.totalPerSide()
+
+        let chunks = WindowPreviewHoverContainer.chunkArray(
+            items: Array(0 ..< windowCount),
+            isHorizontal: isHorizontal,
+            maxColumns: maxColumns,
+            maxRows: maxRows,
+            fillToLimit: fillToLimit
+        )
+
+        // Collect both flow-axis total and cross-axis max from all windows
+        var maxItemWidth: CGFloat = 0
+        var maxItemHeight: CGFloat = 0
+        for dim in dimensionsMap.values {
+            maxItemWidth = max(maxItemWidth, max(dim.size.width, minimumItemWidth))
+            maxItemHeight = max(maxItemHeight, dim.size.height)
+        }
+
+        if isHorizontal {
+            var maxRowWidth: CGFloat = 0
+
+            for row in chunks {
+                var rowWidth: CGFloat = 0
+                for windowIndex in row {
+                    let dims = dimensionsMap[windowIndex]
+                    let itemWidth = dims?.size.width ?? dims?.maxDimensions.width ?? 0
+                    rowWidth += max(itemWidth, minimumItemWidth)
+                }
+                rowWidth += CGFloat(max(0, row.count - 1)) * itemSpacing
+                maxRowWidth = max(maxRowWidth, rowWidth)
+            }
+
+            if hasEmbeddedContent, let firstDims = dimensionsMap[0] {
+                maxRowWidth += max(firstDims.size.width, minimumItemWidth) + itemSpacing
+            }
+
+            // Provide both axes: flow width from item sum, cross height from tallest preview
+            return CGSize(width: maxRowWidth + padding * 2, height: maxItemHeight + padding * 2)
+        } else {
+            var maxColHeight: CGFloat = 0
+
+            for col in chunks {
+                var colHeight: CGFloat = 0
+                for windowIndex in col {
+                    let dims = dimensionsMap[windowIndex]
+                    colHeight += dims?.size.height ?? dims?.maxDimensions.height ?? 0
+                }
+                colHeight += CGFloat(max(0, col.count - 1)) * itemSpacing
+                maxColHeight = max(maxColHeight, colHeight)
+            }
+
+            if hasEmbeddedContent {
+                maxColHeight += estimatedEmbeddedWidgetHeight + itemSpacing
+            }
+
+            // Provide both axes: flow height from item sum, cross width from widest preview
+            return CGSize(width: maxItemWidth + padding * 2, height: maxColHeight + padding * 2)
+        }
+    }
+
+    @MainActor
+    private func updateIndexForSearch() {
+        if !hasActiveSearch {
+            if currIndex >= windows.count {
+                currIndex = windows.isEmpty ? -1 : 0
+            }
+        } else {
+            let filtered = filteredWindowIndices()
+            currIndex = filtered.first ?? -1
+        }
+    }
+
+    /// Returns the indices of windows that match the current search query.
+    /// If no search is active, returns all window indices.
+    func filteredWindowIndices() -> [Int] {
+        if let cached = cachedFilteredIndices { return cached }
+
+        let result: [Int]
+        if !windowSwitcherActive || searchQuery.isEmpty {
+            result = Array(windows.indices)
+        } else {
+            let query = searchQuery.lowercased()
+            let fuzziness = Defaults[.searchFuzziness]
+            result = windows.enumerated().compactMap { idx, win in
+                let appName = win.app.localizedName?.lowercased() ?? ""
+                let windowTitle = (win.windowName ?? "").lowercased()
+                return (StringMatchingUtil.fuzzyMatch(query: query, target: appName, fuzziness: fuzziness) ||
+                    StringMatchingUtil.fuzzyMatch(query: query, target: windowTitle, fuzziness: fuzziness)) ? idx : nil
+            }
+        }
+        cachedFilteredIndices = result
+        return result
+    }
+
+    // MARK: - Keyboard Navigation
+
+    /// Cycle to the next window in the grid
+    @MainActor
+    func cycleForward() {
+        guard !windows.isEmpty else { return }
+
+        if hasActiveSearch {
+            cycleFilteredForward()
+            return
+        }
+
+        shouldScrollToIndex = true
+        if currIndex < 0 {
+            currIndex = 0
+            return
+        }
+
+        let forwardDirection: ArrowDirection = .right
+        currIndex = WindowPreviewHoverContainer.navigateWindowSwitcher(
+            from: currIndex,
+            direction: forwardDirection,
+            totalItems: windows.count,
+            dockPosition: .bottom,
+            isWindowSwitcherActive: true
+        )
+    }
+
+    /// Cycle to the previous window in the grid
+    @MainActor
+    func cycleBackward() {
+        guard !windows.isEmpty else { return }
+
+        if hasActiveSearch {
+            cycleFilteredBackward()
+            return
+        }
+
+        shouldScrollToIndex = true
+        if currIndex < 0 {
+            currIndex = windows.count - 1
+            return
+        }
+
+        let backwardDirection: ArrowDirection = .left
+        currIndex = WindowPreviewHoverContainer.navigateWindowSwitcher(
+            from: currIndex,
+            direction: backwardDirection,
+            totalItems: windows.count,
+            dockPosition: .bottom,
+            isWindowSwitcherActive: true
+        )
+    }
+
+    @MainActor
+    private func cycleFilteredForward() {
+        let filtered = filteredWindowIndices()
+        guard !filtered.isEmpty else { return }
+
+        shouldScrollToIndex = true
+        if currIndex < 0 {
+            currIndex = filtered.first ?? 0
+            return
+        }
+
+        if let currentPos = filtered.firstIndex(of: currIndex) {
+            let nextPos = (currentPos + 1) % filtered.count
+            currIndex = filtered[nextPos]
+        } else {
+            currIndex = filtered.first ?? 0
+        }
+    }
+
+    @MainActor
+    private func cycleFilteredBackward() {
+        let filtered = filteredWindowIndices()
+        guard !filtered.isEmpty else { return }
+
+        shouldScrollToIndex = true
+        if currIndex < 0 {
+            currIndex = filtered.last ?? 0
+            return
+        }
+
+        if let currentPos = filtered.firstIndex(of: currIndex) {
+            let prevPos = (currentPos - 1 + filtered.count) % filtered.count
+            currIndex = filtered[prevPos]
+        } else {
+            currIndex = filtered.last ?? 0
+        }
+    }
+
+    /// Navigate within filtered results using arrow direction
+    @MainActor
+    func navigateFiltered(direction: ArrowDirection) {
+        let filtered = filteredWindowIndices()
+        guard !filtered.isEmpty else { return }
+
+        shouldScrollToIndex = true
+        guard let currentFilteredPos = filtered.firstIndex(of: currIndex) else {
+            currIndex = filtered.first ?? 0
+            return
+        }
+
+        let newFilteredPos = WindowPreviewHoverContainer.navigateWindowSwitcher(
+            from: currentFilteredPos,
+            direction: direction,
+            totalItems: filtered.count,
+            dockPosition: .bottom,
+            isWindowSwitcherActive: true
+        )
+
+        currIndex = filtered[newFilteredPos]
+    }
+
+    // MARK: - Window Switcher Initialization
+
+    /// Initialize for window switcher keybind activation
+    @MainActor
+    func initializeForWindowSwitcher(with newWindows: [WindowInfo], dockPosition: DockPosition, bestGuessMonitor: NSScreen) {
+        setWindows(newWindows, dockPosition: dockPosition, bestGuessMonitor: bestGuessMonitor)
+        searchQuery = ""
+        hasMovedSinceOpen = false
+        initialHoverLocation = NSEvent.mouseLocation
+
+        if !windows.isEmpty {
+            if Defaults[.useClassicWindowOrdering], windows.count >= 2 {
+                currIndex = 1
+            } else {
+                currIndex = 0
+            }
+        } else {
+            currIndex = -1
+        }
+    }
+
+    /// Get the currently selected window
+    func getCurrentWindow() -> WindowInfo? {
+        guard currIndex >= 0, currIndex < windows.count else { return nil }
+        return windows[currIndex]
+    }
+}    @Published private(set) var focusedWindowID: CGWindowID?
 
     var shouldScrollToIndex: Bool = true
 
