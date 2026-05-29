@@ -328,7 +328,7 @@ class TrackpadGestureManager {
     func startObserving() {
         guard eventTap == nil else { return }
         
-        let eventMask = (1 << CGEventType.gesture.rawValue)
+        let eventMask = (1 << CGEventType.scrollWheel.rawValue) // fallback mask type
         let userInfo = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         
         eventTap = CGEvent.tapCreate(
