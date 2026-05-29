@@ -3,12 +3,17 @@ import SwiftUI
 
 struct WindowSwitcherGesturesSection: View {
     @Default(.enableWindowSwitcherGestures) var enableWindowSwitcherGestures
+    
+    // --- ADDED: Link to our new setting memory key ---
+    @Default(.enableWindowSwitcherSwipe) var enableWindowSwitcherSwipe 
+    
     @Default(.switcherSwipeUpAction) var switcherSwipeUpAction
     @Default(.switcherSwipeDownAction) var switcherSwipeDownAction
 
     var body: some View {
         SettingsGroup(header: "Window Switcher Gestures") {
             VStack(alignment: .leading, spacing: 12) {
+                
                 Toggle(isOn: $enableWindowSwitcherGestures) {
                     HStack(spacing: 8) {
                         Image(systemName: "rectangle.3.group")
@@ -17,6 +22,17 @@ struct WindowSwitcherGesturesSection: View {
                     }
                 }
                 .settingsSearchTarget("gestures.switcherGestures")
+                
+                // --- ADDED: The UI Button for our 3-finger swipe ---
+                Toggle(isOn: $enableWindowSwitcherSwipe) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "hand.draw")
+                            .foregroundColor(.accentColor)
+                        Text("Enable 3-finger swipe navigation (AltTab style)")
+                    }
+                }
+                .padding(.bottom, 4)
+                // ---------------------------------------------------
 
                 if enableWindowSwitcherGestures {
                     Text("Swipe up or down on window previews in the keyboard-activated window switcher. Only vertical swipes are recognized, unless in compact mode.")
