@@ -17,6 +17,9 @@ extension DockObserver {
         cmdTabObserver = nil
         stopCmdTabPolling()
         DockObserver.isCmdTabSwitcherActive = false
+        
+        // --- ADDED: Stop observing trackpad gestures when switcher closes ---
+        TrackpadGestureManager.shared.stopObserving()
     }
 
     // MARK: - On-Demand Polling (Event-Driven)
@@ -83,6 +86,12 @@ extension DockObserver {
             }
             try processSwitcherList.subscribeToNotification(cmdTabObserver, kAXUIElementDestroyedNotification as String)
             DockObserver.isCmdTabSwitcherActive = true
+            
+            // --- ADDED: Start observing trackpad gestures when switcher opens (if setting is ON) ---
+            if Defaults[.enableWindowSwitcherSwipe] {
+                TrackpadGestureManager.shared.startObserving()
+            }
+            
         } catch {
             // Ignore subscription errors
         }
