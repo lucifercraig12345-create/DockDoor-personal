@@ -1,0 +1,23 @@
+name: Build Custom DockDoor
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Download Code
+        uses: actions/checkout@v4
+      
+      - name: Build the Mac App
+        run: |
+          xcodebuild clean build -project DockDoor.xcodeproj -scheme DockDoor -configuration Release CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO -derivedDataPath build_output
+          
+      - name: Zip the App
+        run: |
+          cd build_output/Build/Products/Release
+          zip -r DockDoor-Custom.zip DockDoor.app
+          
+      - name: Upload to Browser
+        uses: actions/upload-artifact@v4
+        with:
+          name: DockDoor-Custom-App
+          path: build_output/Build/Products/Release/DockDoor-Custom.zip
